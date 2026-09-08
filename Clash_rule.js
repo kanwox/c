@@ -1,4 +1,4 @@
-// Clash_rule.js v5.3
+// Clash_rule.js v5.3 (Plan A Updated)
 // 注意：需较新的 mihomo 内核；首次启动需联网下载规则集，请在日志中确认全部下载成功。
 
 function main(params) {
@@ -7,12 +7,14 @@ function main(params) {
 
     // 记录订阅自身是否使用代理集合（必须在下方覆写 rule-providers 之前读取）
     const subHasProviders = Object.keys(params["proxy-providers"] || {}).length > 0;
+    // 订阅原始 rule-providers 快照（方案6用于判断 proxy-server-nameserver-policy 里
+    // 的 "rule-set:" 依赖是否确有定义；必须在下方覆写 rule-providers 之前读取）
+    const subRuleProviders = Object.assign({}, params["rule-providers"] || {});
 
+    // 客户端托管字段（mixed-port/allow-lan/mode/log-level/profile）有意不再写入：
+    // 订阅扩展脚本场景下这些值会被客户端运行时配置后置覆盖，写了是冗余，
+    // 且在个别不覆盖的链路上反而会在每次订阅刷新时重置用户的现场设置
     const basicOptions = {
-        "mixed-port": 7892,
-        "allow-lan": false,
-        "mode": "rule",
-        "log-level": "warning",
         "unified-delay": true,
         "tcp-concurrent": true,
         "ipv6": true,
@@ -20,11 +22,7 @@ function main(params) {
         // TCP 保活调优：内核默认间隔仅 15s，移动端费电且长连接易被 NAT 提前掐断；
         // 300/30 为省电与响应速度的折中值
         "keep-alive-idle": 300,
-        "keep-alive-interval": 30,
-        "profile": {
-            "store-selected": true,
-            "store-fake-ip": true
-        }
+        "keep-alive-interval": 30
     };
     Object.assign(params, basicOptions);
     delete params["global-client-fingerprint"];
@@ -188,7 +186,8 @@ function main(params) {
         let count = 0;
         for (const proxy of allProxies) {
             if (proxy && proxy.name && regex.test(proxy.name) && !excludeRe.test(proxy.name)) {
-                count++;if (count >= threshold) return true;
+                count++;
+                if (count >= threshold) return true;
             }
         }
         return false;
@@ -203,8 +202,8 @@ function main(params) {
 
     // ── 订阅 DNS 悬空引用清洗 ──
     // 本脚本会整体重建 rule-providers 与全部策略组，订阅自带配置里指向它们的
-    // rule-set:/geosite: 引用和 "#某组名" 后缀若原样并入，内核会因找不到目标而报错。
-    // geosite: 引用还会触发内核额外下载 geo 文件，与本脚本无 geo 数据的设计冲突。
+    // rule-set:/geosite:/geoip: 引用和 "#某组名" 后缀若原样并入，内核会因找不到目标而报错。
+    // geosite:/geoip: 引用还会触发内核额外下载 geo 文件，与本脚本无 geo 数据的设计冲突。
     // （脚本自己的 rule-set 引用在下方独立写入，不受此清洗影响）
     // 本脚本固定生成的组名（App 组名需与下方 apps 数组保持同步）
     const OWN_GROUPS = ["主代理", "静态", "直连", "AI", "Apple", "GitHub", "Google", "Microsoft",
@@ -214,11 +213,15 @@ function main(params) {
     // 地区组名：不用写死的全量地区码表，改为从上面已经算好的 activeRegions（实际会建组的地区）
     // 动态生成，避免"引用了一个因节点不足而未实际建组的地区"导致内核找不到目标策略组而崩溃
     const REGION_NAMES = new Set(activeRegions.map(region => region.name));
+    // 本地可见节点名并入合法引用集：机场 DNS 用 "#具体节点名" 指定解析节点是内核支持的写法，
+    // 不识别会被误剥成裸奔解析；provider 订阅在脚本期看不到节点，该集合为空、行为不变
+    const PROXY_NAMES = new Set(allProxies.map(proxy => proxy && proxy.name).filter(Boolean));
     // 校验 DNS 条目尾部 "#目标" 后缀：合法则整条保留，
     // 无效（指向已被删除的组）则剥掉、该条 DNS 回落直连（安全默认）
     const refValid = ref => BUILTIN_POLICIES.has(ref)
         || OWN_GROUPS.indexOf(ref) !== -1
-        || REGION_NAMES.has(ref);
+        || REGION_NAMES.has(ref)
+        || PROXY_NAMES.has(ref);
     const stripDanglingRef = entry => {
         const s = String(entry);
         const hash = s.indexOf("#");
@@ -230,13 +233,106 @@ function main(params) {
     const subNS = [].concat(subDNS["nameserver"] || []).map(stripDanglingRef);
     const subPolicy = Object.assign({}, subDNS["nameserver-policy"] || {});
     const subFilter = [].concat(subDNS["fake-ip-filter"] || []).filter(item =>
-        !/^(rule-set|geosite):/i.test(String(item))
+        !/^(rule-set|geosite|geoip):/i.test(String(item))
     );
+
+    // ── 方案8：fake-ip-filter-mode 校验 ──
+    // 缺省或显式 blacklist：沿用上面的黑名单式 subFilter 继承逻辑，最终固定输出 blacklist。
+    // whitelist/rule：语义（甚至 fake-ip-filter 自身语法，rule 模式下变成规则动作列表）完全不同，
+    // 硬继承会反转过滤含义，因此不做猜测性转换，直接报错阻止生成，报出原值与字段路径。
+    const subFilterMode = subDNS["fake-ip-filter-mode"];
+    if (subFilterMode !== undefined && subFilterMode !== "blacklist") {
+        throw new Error(
+            `[Clash_rule.js] dns.fake-ip-filter-mode = "${subFilterMode}"：` +
+            `本脚本仅支持继承 blacklist（缺省同样按 blacklist 处理）。whitelist/rule 模式下 ` +
+            `fake-ip-filter 的语义和语法均不同，无法安全迁移，已阻止生成，请人工核实该字段后再处理。`
+        );
+    }
 
     for (const k of Object.keys(subPolicy)) {
         if (k === "+." || k === "*" || k === "+") { delete subPolicy[k]; continue; }    // 通吃键架空分流，丢弃
-        if (/^(rule-set|geosite):/i.test(k)) { delete subPolicy[k]; continue; }         // 指向已重建的规则集，丢弃
+        if (/^(rule-set|geosite|geoip):/i.test(k)) { delete subPolicy[k]; continue; }    // 指向已重建的规则集/内核内建 geo 数据，丢弃
         subPolicy[k] = [].concat(subPolicy[k]).map(stripDanglingRef);                   // 值里的 "#组名" 悬空引用同样清洗
+    }
+
+    // ── 方案6：机场显式节点 DNS —— 清洗 proxy-server-nameserver-policy ──
+    // 键：保留通吃键（"+."/"*"/"+"），不套用普通 nameserver-policy 那套"通吃键必须删除"的逻辑。
+    //   - geosite:/geoip: 键：脚本不引入 geo 数据，无法准确迁移，明确报错阻止生成。
+    //   - rule-set: 键：仅当该名字在订阅原始 rule-providers 中确有定义时，视为"必要旧依赖"保留，
+    //     并把该 provider 原始定义一并带入最终 rule-providers（与脚本自身键重名则报错，不静默替换）；
+    //     订阅里查不到定义的 rule-set: 键视为悬空引用，丢弃（不报错，与其它悬空引用清洗一致）。
+    // 值：与其它 DNS 字段一致，用 stripDanglingRef 清洗 "#组名" 后缀。
+    const rawPSNPolicy = subDNS["proxy-server-nameserver-policy"] || {};
+    const subPSNPolicy = {};
+    const carriedRuleProviders = {};
+    for (const k of Object.keys(rawPSNPolicy)) {
+        if (/^(geosite|geoip):/i.test(k)) {
+            throw new Error(
+                `[Clash_rule.js] dns.proxy-server-nameserver-policy 的键 "${k}" 引用 geosite/geoip，` +
+                `本脚本不引入 geo 数据、无法准确迁移，已阻止生成，请人工处理该键后重试。`
+            );
+        }
+        if (/^rule-set:/i.test(k)) {
+            const rsName = k.slice("rule-set:".length);
+            if (Object.prototype.hasOwnProperty.call(subRuleProviders, rsName)) {
+                carriedRuleProviders[rsName] = subRuleProviders[rsName];
+                subPSNPolicy[k] = [].concat(rawPSNPolicy[k]).map(stripDanglingRef);
+            }
+            // 订阅原始配置里查不到该 rule-provider 定义：悬空引用，丢弃
+            continue;
+        }
+        subPSNPolicy[k] = [].concat(rawPSNPolicy[k]).map(stripDanglingRef);
+    }
+
+    const psnExplicit = subPSN.length > 0;
+    let proxyServerNameserver;
+    let proxyServerNameserverPolicy;
+
+    if (psnExplicit) {
+        // 方案6：机场显式设置了节点 DNS，独占使用，不混入公共 DNS
+        proxyServerNameserver = [...new Set(subPSN)];
+        proxyServerNameserverPolicy = subPSNPolicy;
+    } else {
+        if (Object.keys(subPSNPolicy).length > 0) {
+            // 配置了节点 policy 却没有节点 nameserver：原配置里这个 policy 可能本就未生效，
+            // 不能无提示激活——按未显式设置处理，走下面的方案7迁移/兜底逻辑
+            console.warn(
+                "[Clash_rule.js] 订阅设置了 dns.proxy-server-nameserver-policy 但 " +
+                "dns.proxy-server-nameserver 为空：该 policy 在原配置里可能并未生效，" +
+                "本次不代入运行，proxy-server-nameserver-policy 按未设置处理。"
+            );
+        }
+        // 方案7：机场未显式设置节点 DNS —— 用原普通域名解析策略作为迁移来源，
+        // 避免脚本新补的公共节点 DNS 屏蔽机场专用解析
+        const hasFallbackComplexity = subDNS.fallback !== undefined || subDNS["fallback-filter"] !== undefined;
+        if (hasFallbackComplexity) {
+            // fallback / fallback-filter 属于"路由选出 DNS 出口"的复杂行为，无法在
+            // proxy-server-nameserver（单一列表）里等价表达；不拼接列表假装等价，
+            // 也不静默回退公共 DNS——按无法确认的情况阻止转换并说明原因
+            throw new Error(
+                "[Clash_rule.js] 订阅未显式设置 dns.proxy-server-nameserver，且原配置存在 " +
+                `dns.fallback${subDNS["fallback-filter"] !== undefined ? "/dns.fallback-filter" : ""}` +
+                "（路由选出 DNS 出口的复杂行为），无法等价迁移到节点解析，已阻止生成，请人工核实该字段后再处理。"
+            );
+        } else if (subNS.length > 0 || Object.keys(subPolicy).length > 0) {
+            // 普通域名解析策略/服务器按原优先关系迁入节点解析（policy 优先于 nameserver 的相对关系不变）
+            proxyServerNameserver = subNS.length > 0
+                ? [...new Set(subNS)]
+                : [
+                    "https://223.5.5.5/dns-query",
+                    "https://doh.pub/dns-query"
+                ];
+            proxyServerNameserverPolicy = Object.keys(subPolicy).length > 0
+                ? Object.assign({}, subPolicy)
+                : undefined;
+        } else {
+            // 原配置没有任何可继承的解析信息，才使用脚本默认公共 DNS
+            proxyServerNameserver = [
+                "https://223.5.5.5/dns-query",
+                "https://doh.pub/dns-query"
+            ];
+            proxyServerNameserverPolicy = undefined;
+        }
     }
 
     params["dns"] = {
@@ -249,6 +345,8 @@ function main(params) {
         // IPv6 fake-ip 段：官方示例的文档专用段；勿改用 fc00::/7 等内网保留地址，避免与真实局域网冲突
         "fake-ip-range6": "fdfe:dcba:9876::/64",
         "cache-algorithm": "arc",
+        // 显式声明，不依赖内核默认值；上方已校验订阅原模式缺省/blacklist 才会走到这里
+        "fake-ip-filter-mode": "blacklist",
         // 保留订阅自带的 hosts 能力
         "use-hosts": subDNS["use-hosts"] !== undefined ? subDNS["use-hosts"] : true,
         "use-system-hosts": subDNS["use-system-hosts"] !== undefined ? subDNS["use-system-hosts"] : true,
@@ -287,14 +385,12 @@ function main(params) {
             "223.5.5.5",
             "119.29.29.29"
         ],
-        // 机场优先、独占不混用：机场指定了节点解析 DNS 就只用机场的，
-        // 避免公共 DNS 并发抢答把专线隐蔽域名解析成错误的落地 IP；机场没指定才用国内 DoH 兜底
-        "proxy-server-nameserver": subPSN.length > 0
-            ? [...new Set(subPSN)]
-            : [
-                "https://223.5.5.5/dns-query",
-                "https://doh.pub/dns-query"
-            ],
+        // 机场优先、独占不混用：机场指定了节点解析 DNS（方案6）就只用机场的；
+        // 没指定则走方案7的迁移/兜底逻辑（见上方 proxyServerNameserver 计算）
+        "proxy-server-nameserver": proxyServerNameserver,
+        ...(proxyServerNameserverPolicy && Object.keys(proxyServerNameserverPolicy).length > 0
+            ? { "proxy-server-nameserver-policy": proxyServerNameserverPolicy }
+            : {}),
         // 主解析同理：机场指定了 DNS 就独占使用；否则用规则默认（走主代理隧道查询）兜底
         "nameserver": subNS.length > 0
             ? [...new Set(subNS)]
@@ -303,8 +399,7 @@ function main(params) {
                 "https://8.8.8.8/dns-query#主代理"
             ],
         // 规则命中 DIRECT 但未被下方 nameserver-policy 单独覆盖的域名（例如未收录进
-        // cn-domain 分类的冷门国内站点，配合下方 cn-ip 规则去掉 no-resolve 后需要真实解析）
-        // 用国内 DNS 解析，避免退回 nameserver 走主代理查询海外 DNS，导致解析慢、拿错境外 CDN IP
+        // cn-domain 分类的冷门国内站点）用国内 DNS 解析，避免退回 nameserver 走主代理查询海外 DNS
         // 用纯 IP 而非 DoH：该字段用 DoH 时有部分环境会反复回退到 default-nameserver 重复解析、拖高延迟
         "direct-nameserver": [
             "223.5.5.5",
@@ -392,6 +487,17 @@ function main(params) {
         "path": "./ruleset/fakeip-filter.mrs",
         "interval": 2592000
     };
+    // 方案6：并入 proxy-server-nameserver-policy 里确认必要的旧 rule-set 依赖
+    // （carriedRuleProviders 在上方 dns 计算阶段已确认这些名字在订阅原始 rule-providers 中存在定义）
+    Object.keys(carriedRuleProviders).forEach(name => {
+        if (Object.prototype.hasOwnProperty.call(params["rule-providers"], name)) {
+            throw new Error(
+                `[Clash_rule.js] proxy-server-nameserver-policy 依赖的旧 rule-set "${name}" ` +
+                `与本脚本自建的规则集同名，但内容来源不同，不能直接替换成脚本规则集，已阻止生成。`
+            );
+        }
+        params["rule-providers"][name] = carriedRuleProviders[name];
+    });
 
     const FP_OK = ["vless", "vmess", "trojan"];
     (params.proxies || []).forEach(proxy => {
@@ -403,21 +509,44 @@ function main(params) {
         }
     });
 
-    Object.values(params["proxy-providers"] || {}).forEach(provider => {
+    // 方案5：override-expr 规范化
+    // 修复：使用 .["client-fingerprint"] 避免 yq/jq 把连字符 '-' 误解析为减法运算符
+    const FP_EXPR = '(select(.type == "trojan" or ((.type == "vless" or .type == "vmess") and (.tls == true or has("reality-opts")))) | select(has("client-fingerprint") | not) | .["client-fingerprint"]) = "chrome"';
+    const normalizeOverrideExpr = (raw, providerName) => {
+        if (raw === undefined || raw === null) return [];
+        if (typeof raw === "string") return raw.length > 0 ? [raw] : [];
+        if (Array.isArray(raw)) {
+            return raw.filter(item => {
+                if (typeof item !== "string") {
+                    throw new Error(
+                        `[Clash_rule.js] proxy-providers.${providerName}.override.override-expr 中存在非字符串项 ` +
+                        `(${JSON.stringify(item)})，已阻止生成。`
+                    );
+                }
+                return item.length > 0;
+            });
+        }
+        throw new Error(
+            `[Clash_rule.js] proxy-providers.${providerName}.override.override-expr 类型非法 (${typeof raw})，` +
+            `应为字符串或字符串数组，已阻止生成。`
+        );
+    };
+
+    Object.entries(params["proxy-providers"] || {}).forEach(([name, provider]) => {
         if (provider && typeof provider === "object") {
+            const existingExpr = normalizeOverrideExpr((provider.override || {})["override-expr"], name);
+            // 保留原表达式顺序；只保证脚本自己的指纹表达式最多出现一次，不重排/不普遍去重上游表达式
+            const finalExpr = existingExpr.includes(FP_EXPR) ? existingExpr : [...existingExpr, FP_EXPR];
             provider.override = Object.assign({}, provider.override || {}, {
                 "ip-version": "ipv4-prefer",
-                "override-expr": [
-                    ...(((provider.override || {})["override-expr"]) || []),
-                    '(select(.type == "trojan" or ((.type == "vless" or .type == "vmess") and (.tls == true or has("reality-opts")))) | select(has("client-fingerprint") | not) | .client-fingerprint) = "chrome"'
-                ]
+                "override-expr": finalExpr
             });
         }
     });
 
     let groups = [];
 
-    //主代理
+    // 主代理
     groups.push({
         name: "主代理",
         type: "select",
@@ -456,7 +585,7 @@ function main(params) {
     ];
 
     const apps = [
-        { name: "AI",icon: "openai.png" },
+        { name: "AI",        icon: "openai.png" },
         { name: "Apple",     icon: "apple.png" },
         { name: "GitHub",    icon: "https://i.postimg.cc/vTSTYrLQ/github.png" },
         { name: "Google",    icon: "google.png" },
@@ -539,9 +668,9 @@ function main(params) {
         "RULE-SET,microsoft-domain,Microsoft",
 
         "RULE-SET,cn-domain,DIRECT",
-        // 去掉 no-resolve：配合上方 dns.direct-nameserver，让未被 cn-domain 收录的冷门
-        // 国内站点也能在命中该规则前完成真实 IP 解析、判断是否落在境内网段
-        "RULE-SET,cn-ip,DIRECT",
+        // 方案 A：增加 no-resolve，遇到 Fake-IP 域名直接跳过，避免未收录的海外冷门站点
+        // 在进入 MATCH 兜底前被强行通过海外 nameserver 解析引入额外延迟，彻底保障秒开体验
+        "RULE-SET,cn-ip,DIRECT,no-resolve",
 
         "MATCH,主代理"
     ];
